@@ -1,0 +1,1665 @@
+---
+title: "yan_indrop"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r functions}
+
+library(readr)
+library(dplyr)
+library(Seurat)
+library(data.table)
+library(useful)
+
+
+translate.dim.code=function(reduction.use) {
+  return.code="PC"
+  if (reduction.use=="ica") return.code="IC"
+  else if (reduction.use=="tsne") return.code="tSNE_"
+  else if (reduction.use=="mds") return.code="MDS"
+  else if  (reduction.use=="umap") return.code="UMAP"
+  return(return.code)
+}
+
+GeoFeaturePlot <-  function(object, features, reduction.use = "umap", dim.1 = 1, 
+                          dim.2 = 2, pt.size = 1, cells.use = NULL, use.imputed = FALSE, cols.use = c("grey", "blue"), pch.use = 16, do.label = TRUE) {
+  dim.code = translate.dim.code(reduction.use)
+  dim.codes = paste(dim.code, c(dim.1, dim.2), sep = "")
+  data.plot = FetchData(object, dim.codes)
+  x1 = paste(dim.code, dim.1, sep = "")
+  x2 = paste(dim.code, dim.2, sep = "")
+  data.plot$x = data.plot[, x1]
+  data.plot$y = data.plot[, x2]
+  data.plot$pt.size = pt.size
+  data.use = data.frame(t(FetchData(object, features)))
+  geomeans = colMeans(data.use)
+  if (length(cols.use) == 1) {
+    brewer.gran <- brewer.pal.info[cols.use, ]$maxcolors
+  } else {
+    brewer.gran <- length(cols.use)
+  }
+  data.plot$geomean = geomeans
+  data.cut = as.numeric(cut(as.numeric(geomeans), breaks = 2))
+  data.plot$cut = data.cut
+  data.plot$col = as.factor(data.cut)
+  data.plot$ident = as.factor(object@meta.data$RNA_snn_res.0.8)
+  data_plot_cell <- data.plot %>% tibble::rownames_to_column(var = "cell")
+  metadata_cell <- object@meta.data %>% tibble::rownames_to_column(var="cell")
+  data.plot <- data_plot_cell %>% left_join(metadata_cell, by = "cell") 
+
+  return(data.plot)
+}
+
+correct <- function(x) { return (1e6*x/sum(x))}
+
+get_upregulated_genes_in_clusters <- function(seurat_object, forgeround_clusters, control_clusters, logfc_threshold=1, fg_expression_threshold=10)
+{
+  cluster_cells_fg <- Seurat::WhichCells(seurat_object, ident = forgeround_clusters)
+  control_all <- Seurat::WhichCells(seurat_object, ident = control_clusters)
+  
+  return (get_upregulated_genes_in_cells(seurat_object, cluster_cells_fg, control_all, logfc_threshold, fg_expression_threshold))
+  
+}
+
+
+get_upregulated_genes_in_cells <- function(seurat_object, foreground_cells, control_cells, logfc_threshold=1, fg_expression_threshold=10)
+{
+  
+  raw_data_cluster_cells_fg <- seurat_object@raw.data[rownames(seurat_object@data), foreground_cells]
+  raw_data_control_all <- seurat_object@raw.data[rownames(seurat_object@data), control_cells]
+  
+  raw_data_cluster_fg_gene_counts <- rowSums(as.matrix(raw_data_cluster_cells_fg))
+  raw_data_all_control_gene_counts <- rowSums(raw_data_control_all)  
+  
+  
+  all_cells <- data.frame("cluster_cells_fg"=raw_data_cluster_fg_gene_counts, "control_all"=raw_data_all_control_gene_counts)
+  
+  all_cells_corrected <- as.data.frame(apply(all_cells, 2, correct))
+  
+  all_cells_corrected$logfc_all_cluster_fg_vs_control <- log2(all_cells_corrected$cluster_cells_fg+0.1) - log2(all_cells_corrected$control_all+0.1)
+  
+  all_cells_corrected$fg_fraction <- apply(seurat_object@data[,foreground_cells],1,function(x)return(length(x[x>1])/length(x)))
+  
+  all_cells_corrected$bg_fraction <- apply(seurat_object@data[,control_cells],1,function(x)return(length(x[x>1])/length(x)))
+  all_cells_corrected$diff_in_enrichment <- all_cells_corrected$fg_fraction - all_cells_corrected$bg_fraction
+  
+  all_cells_corrected$fg_cells_expressing <- apply(seurat_object@data[,foreground_cells],1,function(x)return(length(x[x>1])))
+  all_cells_corrected$bg_cells_expressing <- apply(seurat_object@data[,control_cells],1,function(x)return(length(x[x>1])))
+  all_cells_corrected$fg_cells_notexpressing <- length(foreground_cells) - all_cells_corrected$fg_cells_expressing 
+  all_cells_corrected$bg_cells_notexpressing <- length(control_cells) - all_cells_corrected$bg_cells_expressing 
+
+  all_cells_corrected$fisher_exact_p <- foreach(i = 1:nrow(all_cells_corrected), .combine = c) %do% 
+  {
+    m <- matrix(c(all_cells_corrected$fg_cells_expressing[i], 
+                  all_cells_corrected$bg_cells_expressing[i],
+                  all_cells_corrected$fg_cells_notexpressing[i],
+                  all_cells_corrected$bg_cells_notexpressing[i]), nrow=2, byrow = TRUE)
+    fisher.test(m)$p.value
+  }
+  all_cells_corrected$p.adjusted <- p.adjust(all_cells_corrected$fisher_exact_p, method = "BH")
+  
+  
+  fish_to_human %>% 
+    mutate("genename.dot" = gsub(gsub(Gene, pattern="-", replacement="."), pattern=":", replacement=".")) %>% 
+    select(-EnsembleID)  %>% 
+    unique -> fish_to_human.dot
+  marker_gene_rows <- all_cells_corrected[all_cells_corrected$logfc_all_cluster_fg_vs_control > logfc_threshold & all_cells_corrected$cluster_cells_fg > fg_expression_threshold,]
+  marker_genes <- marker_gene_rows[order(marker_gene_rows$diff_in_enrichment, decreasing = TRUE),] %>% tibble::rownames_to_column(var="genename") %>% left_join(fish_to_human.dot,by=c("genename"="genename.dot"))
+  
+  return (marker_genes)
+  
+}
+
+get_downregulated_genes_in_clusters <- function(seurat_object, forgeround_clusters, control_clusters, logfc_threshold=-1, fg_expression_threshold=1)
+{
+  cluster_cells_fg <- WhichCells(seurat_object, ident = forgeround_clusters)
+  control_all <- WhichCells(seurat_object, ident = control_clusters)
+  
+  return (get_downregulated_genes_in_cells(seurat_object, cluster_cells_fg, control_all, logfc_threshold, fg_expression_threshold))
+  
+}
+
+
+get_downregulated_genes_in_cells <- function(seurat_object, foreground_cells, control_cells, logfc_threshold=-1, fg_expression_threshold=1)
+{
+  
+  raw_data_cluster_cells_fg <- seurat_object@raw.data[rownames(seurat_object@data), foreground_cells]
+  raw_data_control_all <- seurat_object@raw.data[rownames(seurat_object@data), control_cells]
+  
+  raw_data_cluster_fg_gene_counts <- rowSums(raw_data_cluster_cells_fg)
+  raw_data_all_control_gene_counts <- rowSums(raw_data_control_all)  
+  
+  
+  all_cells <- data.frame("cluster_cells_fg"=raw_data_cluster_fg_gene_counts, "control_all"=raw_data_all_control_gene_counts)
+  
+  all_cells_corrected <- as.data.frame(apply(all_cells, 2, correct))
+  
+  all_cells_corrected$logfc_all_cluster_fg_vs_control <- log2(all_cells_corrected$cluster_cells_fg+0.1) - log2(all_cells_corrected$control_all+0.1)
+  
+  all_cells_corrected$fg_fraction <- apply(seurat_object@data[,foreground_cells],1,function(x)return(length(x[x>1])/length(x)))
+  
+  all_cells_corrected$bg_fraction <- apply(seurat_object@data[,control_cells],1,function(x)return(length(x[x>1])/length(x)))
+  all_cells_corrected$diff_in_enrichment <- all_cells_corrected$fg_fraction - all_cells_corrected$bg_fraction
+  
+  all_cells_corrected$fg_cells_expressing <- apply(seurat_object@data[,foreground_cells],1,function(x)return(length(x[x>1])))
+  all_cells_corrected$bg_cells_expressing <- apply(seurat_object@data[,control_cells],1,function(x)return(length(x[x>1])))
+  all_cells_corrected$fg_cells_notexpressing <- length(foreground_cells) - all_cells_corrected$fg_cells_expressing 
+  all_cells_corrected$bg_cells_notexpressing <- length(control_cells) - all_cells_corrected$bg_cells_expressing 
+  
+  all_cells_corrected$fisher_exact_p <- foreach(i = 1:nrow(all_cells_corrected), .combine = c) %do% 
+  {
+    m <- matrix(c(all_cells_corrected$fg_cells_expressing[i], 
+                  all_cells_corrected$bg_cells_expressing[i],
+                  all_cells_corrected$fg_cells_notexpressing[i],
+                  all_cells_corrected$bg_cells_notexpressing[i]), nrow=2, byrow = TRUE)
+    fisher.test(m)$p.value
+  }
+  all_cells_corrected$p.adjusted <- p.adjust(all_cells_corrected$fisher_exact_p, method = "BH")
+  print(head(rownames(all_cells_corrected)[order(all_cells_corrected$logfc_all_cluster_fg_vs_control, decreasing = T)], 20))
+  
+  fish_to_human %>% 
+    mutate("genename.dot" = gsub(gsub(genename, pattern="-", replacement="."), pattern=":", replacement=".")) %>% 
+    select(-ens_id)  %>% 
+    unique -> fish_to_human.dot
+  marker_gene_rows <- all_cells_corrected[all_cells_corrected$logfc_all_cluster_fg_vs_control < logfc_threshold & all_cells_corrected$cluster_cells_fg < fg_expression_threshold,]
+  marker_genes <- marker_gene_rows[order(marker_gene_rows$diff_in_enrichment, decreasing = TRUE),] %>%
+    rownames_to_column(var="genename") %>% left_join(fish_to_human.dot,by=c("genename"="genename.dot"))
+  
+  return (marker_genes)
+  
+}
+```
+
+
+```{r setup, include=FALSE}
+library(readr)
+library(dplyr)
+library(Seurat)
+library(data.table)
+library(useful)
+
+fish_to_human <- read_tsv("/data/langenau/Beagle_fish_human_all_genes.txt")
+fish_to_human$Hsortholog[is.na(fish_to_human$Hsortholog)] <- fish_to_human$Hs_closest[is.na(fish_to_human$Hsortholog)]
+
+
+
+wt_qin_rep1.data <- t(as.data.frame(fread("/data/langenau/indrops_out/RL_inDrop/WT_1/quant_dir/rerun_RL_indrops_pipeline.12_21_2016.worker0_1.counts.tsv")))
+colnames(wt_qin_rep1.data) <- wt_qin_rep1.data[1,]
+wt_qin_rep1.data <- wt_qin_rep1.data[-1,]
+
+
+class(wt_qin_rep1.data) <- "numeric"
+corner(wt_qin_rep1.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+wt_qin_rep1 <- CreateSeuratObject(counts = wt_qin_rep1.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+wt_qin_rep1@meta.data$genotype <- "WT"
+wt_qin_rep1@meta.data$rep <- "qinrep1"
+wt_qin_rep1@meta.data$samplename <- "WT_qinrep1"
+
+rag2_rep1.data <- t(as.data.frame(fread("zcat /data/langenau/yan_indrop/indrops_out_L134/rag2_rep1/rag2_rep1yan_indrop..counts.tsv.gz")))
+colnames(rag2_rep1.data) <- rag2_rep1.data[1,]
+rag2_rep1.data <- rag2_rep1.data[-1,]
+
+class(rag2_rep1.data) <- "numeric"
+corner(rag2_rep1.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+rag2_rep1 <- CreateSeuratObject(counts = rag2_rep1.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+rag2_rep1@meta.data$genotype <- "rag2"
+rag2_rep1@meta.data$rep <- "rep1"
+rag2_rep1@meta.data$samplename <- "rag2_rep1"
+
+rag2il2rga_rep1.data <- t(as.data.frame(fread("zcat /data/langenau/yan_indrop/indrops_out_L134/rag2il2rga_rep1/rag2il2rga_rep1yan_indrop..counts.tsv.gz")))
+colnames(rag2il2rga_rep1.data) <- rag2il2rga_rep1.data[1,]
+rag2il2rga_rep1.data <- rag2il2rga_rep1.data[-1,]
+
+class(rag2il2rga_rep1.data) <- "numeric"
+corner(rag2il2rga_rep1.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+rag2il2rga_rep1 <- CreateSeuratObject(counts = rag2il2rga_rep1.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+rag2il2rga_rep1@meta.data$genotype <- "rag2il2rga"
+rag2il2rga_rep1@meta.data$rep <- "rep1"
+rag2il2rga_rep1@meta.data$samplename <- "rag2il2rga_rep1"
+
+indrop.combined <- merge(wt_qin_rep1, y = rag2_rep1,  project = "yan_indrop")
+indrop.combined <- merge(indrop.combined, y = rag2il2rga_rep1,  project = "yan_indrop")
+indrop.combined <- merge(indrop.combined, y = wt_qin_rep3,  project = "yan_indrop")
+dplyr::count(indrop.combined@meta.data, genotype, rep)
+
+
+# wt_rep1.data <- t(as.data.frame(fread("zcat /data/langenau/yan_indrop/indrops_out_L134/WT_rep1/WT_rep1yan_indrop..counts.tsv.gz")))
+# colnames(wt_rep1.data) <- wt_rep1.data[1,]
+# wt_rep1.data <- wt_rep1.data[-1,]
+# 
+# 
+# class(wt_rep1.data) <- "numeric"
+# corner(wt_rep1.data)
+# # Initialize the Seurat object with the raw (non-normalized data).
+# wt_rep1 <- CreateSeuratObject(counts = wt_rep1.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+# wt_rep1@meta.data$genotype <- "WT"
+# wt_rep1@meta.data$rep <- "rep1"
+# wt_rep1@meta.data$samplename <- "WT_rep1"
+
+
+wt_qin_rep3.data <- t(as.data.frame(fread("/data/langenau/indrops_out/QT_inDrop_1205_and_06_2016/WT_3/quant_dir/round2.12_19_2016.worker0_1.counts.tsv")))
+colnames(wt_qin_rep3.data) <- wt_qin_rep3.data[1,]
+wt_qin_rep3.data <- wt_qin_rep3.data[-1,]
+
+
+class(wt_qin_rep3.data) <- "numeric"
+corner(wt_qin_rep3.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+wt_qin_rep3 <- CreateSeuratObject(counts = wt_qin_rep3.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+wt_qin_rep3@meta.data$genotype <- "WT"
+wt_qin_rep3@meta.data$rep <- "qinrep3"
+wt_qin_rep3@meta.data$samplename <- "WT_qinrep3"
+indrop.combined <- merge(indrop.combined, y = wt_qin_rep3,  project = "yan_indrop")
+
+
+
+prkdc_rep1.data <- t(as.data.frame(fread("/data/langenau/indrops_out/RL_inDrop/PRKDC_1/quant_dir/rerun_RL_indrops_pipeline.12_21_2016.worker0_1.counts.tsv")))
+colnames(prkdc_rep1.data) <- prkdc_rep1.data[1,]
+prkdc_rep1.data <- prkdc_rep1.data[-1,]
+
+class(prkdc_rep1.data) <- "numeric"
+corner(prkdc_rep1.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+prkdc_rep1 <- CreateSeuratObject(counts = prkdc_rep1.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+prkdc_rep1@meta.data$genotype <- "prkdc"
+prkdc_rep1@meta.data$rep <- "rep1"
+prkdc_rep1@meta.data$samplename <- "prkdc_rep1"
+indrop.combined <- merge(indrop.combined, y = prkdc_rep1,  project = "yan_indrop")
+
+
+prkdc_rep2.data <- t(as.data.frame(fread("/data/langenau/indrops_out/RL_inDrop/PRKDC_2/quant_dir/rerun_RL_indrops_pipeline.12_21_2016.worker0_1.counts.tsv")))
+colnames(prkdc_rep2.data) <- prkdc_rep2.data[1,]
+prkdc_rep2.data <- prkdc_rep2.data[-1,]
+
+class(prkdc_rep2.data) <- "numeric"
+corner(prkdc_rep2.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+prkdc_rep2 <- CreateSeuratObject(counts = prkdc_rep2.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+prkdc_rep2@meta.data$genotype <- "prkdc"
+prkdc_rep2@meta.data$rep <- "rep2"
+prkdc_rep2@meta.data$samplename <- "prkdc_rep2"
+indrop.combined <- merge(indrop.combined, y = prkdc_rep2,  project = "yan_indrop")
+
+
+prkdc_rep3.data <- t(as.data.frame(fread("/data/langenau/indrops_out/QT_inDrop_1205_and_06_2016/PRKDC_3/quant_dir/round2.12_19_2016.worker0_1.counts.tsv")))
+colnames(prkdc_rep3.data) <- prkdc_rep3.data[1,]
+prkdc_rep3.data <- prkdc_rep3.data[-1,]
+
+class(prkdc_rep3.data) <- "numeric"
+corner(prkdc_rep3.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+prkdc_rep3 <- CreateSeuratObject(counts = prkdc_rep3.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+prkdc_rep3@meta.data$genotype <- "prkdc"
+prkdc_rep3@meta.data$rep <- "rep3"
+prkdc_rep3@meta.data$samplename <- "prkdc_rep3"
+indrop.combined <- merge(indrop.combined, y = prkdc_rep3,  project = "yan_indrop")
+
+
+prkdc_il2rga_rep1.data <- t(as.data.frame(fread("/data/langenau/indrops_out/QT_inDrop_1205_and_06_2016/PRKDC_and_IL2RGA_1/quant_dir/round2.12_19_2016.worker0_1.counts.tsv")))
+colnames(prkdc_il2rga_rep1.data) <- prkdc_il2rga_rep1.data[1,]
+prkdc_il2rga_rep1.data <- prkdc_il2rga_rep1.data[-1,]
+
+class(prkdc_il2rga_rep1.data) <- "numeric"
+corner(prkdc_il2rga_rep1.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+prkdc_il2rga_rep1 <- CreateSeuratObject(counts = prkdc_il2rga_rep1.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+prkdc_il2rga_rep1@meta.data$genotype <- "prkdc_il2rga"
+prkdc_il2rga_rep1@meta.data$rep <- "rep1"
+prkdc_il2rga_rep1@meta.data$samplename <- "prkdc_il2rga_rep1"
+indrop.combined <- merge(indrop.combined, y = prkdc_il2rga_rep1,  project = "yan_indrop")
+
+
+prkdc_il2rga_rep2.data <- t(as.data.frame(fread("/data/langenau/indrops_out/QT_inDrop_1205_and_06_2016/PRKDC_and_IL2RGA_2/quant_dir/round2.12_19_2016.worker0_1.counts.tsv")))
+colnames(prkdc_il2rga_rep2.data) <- prkdc_il2rga_rep2.data[1,]
+prkdc_il2rga_rep2.data <- prkdc_il2rga_rep2.data[-1,]
+
+class(prkdc_il2rga_rep2.data) <- "numeric"
+corner(prkdc_il2rga_rep2.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+prkdc_il2rga_rep2 <- CreateSeuratObject(counts = prkdc_il2rga_rep2.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+prkdc_il2rga_rep2@meta.data$genotype <- "prkdc_il2rga"
+prkdc_il2rga_rep2@meta.data$rep <- "rep2"
+prkdc_il2rga_rep2@meta.data$samplename <- "prkdc_il2rga_rep2"
+indrop.combined <- merge(indrop.combined, y = prkdc_il2rga_rep2,  project = "yan_indrop")
+
+
+il2rga_rep1.data <- t(as.data.frame(fread("/data/langenau/indrops_out/QT_inDrop_1205_and_06_2016/IL2RGA_1/quant_dir/round2.12_19_2016.worker0_1.counts.tsv")))
+colnames(il2rga_rep1.data) <- il2rga_rep1.data[1,]
+il2rga_rep1.data <- il2rga_rep1.data[-1,]
+
+class(il2rga_rep1.data) <- "numeric"
+corner(il2rga_rep1.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+il2rga_rep1 <- CreateSeuratObject(counts = il2rga_rep1.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+il2rga_rep1@meta.data$genotype <- "il2rga"
+il2rga_rep1@meta.data$rep <- "rep1"
+il2rga_rep1@meta.data$samplename <- "il2rga_rep1"
+indrop.combined <- merge(indrop.combined, y = il2rga_rep1,  project = "yan_indrop")
+
+
+il2rga_rep2.data <- t(as.data.frame(fread("/data/langenau/indrops_out/QT_inDrop_1205_and_06_2016/IL2RGA_2/quant_dir/round2.12_19_2016.worker0_1.counts.tsv")))
+colnames(il2rga_rep2.data) <- il2rga_rep2.data[1,]
+il2rga_rep2.data <- il2rga_rep2.data[-1,]
+
+class(il2rga_rep2.data) <- "numeric"
+corner(il2rga_rep2.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+il2rga_rep2 <- CreateSeuratObject(counts = il2rga_rep2.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+il2rga_rep2@meta.data$genotype <- "il2rga"
+il2rga_rep2@meta.data$rep <- "rep2"
+il2rga_rep2@meta.data$samplename <- "il2rga_rep2"
+indrop.combined <- merge(indrop.combined, y = il2rga_rep2,  project = "yan_indrop")
+
+
+
+
+#write_rds(indrop.combined, path = "/data/langenau/yan_indrop/indrop.combined.WITH_QIN_REP1_and_REP3.07222019.rds")
+
+
+
+#indrop.combined
+dim(indrop.combined@meta.data)
+table(indrop.combined@meta.data$genotype)
+
+indrop.combined@meta.data %>%
+  ggplot(aes(x=genotype, y=nFeature_RNA)) + geom_boxplot()
+
+indrop.combined[["percent.mt"]] <- PercentageFeatureSet(indrop.combined, pattern = "^mt-")
+VlnPlot(indrop.combined, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+indrop.combined <- NormalizeData(indrop.combined, normalization.method = "LogNormalize", scale.factor = 10000)
+
+indrop.combined <- FindVariableFeatures(indrop.combined, selection.method = "vst", nfeatures = 2000)
+top10 <- head(VariableFeatures(indrop.combined), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(indrop.combined)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+
+
+
+indrop.combined <- ScaleData(indrop.combined, vars.to.regress = c("percent.mt","nFeature_RNA", "nCount_RNA"))
+indrop.combined <- RunPCA(indrop.combined, verbose = FALSE)
+ElbowPlot(indrop.combined, ndims = 50)
+
+PCAPlot(indrop.combined, group.by="genotype")
+DimHeatmap(indrop.combined, dims = 1:5, cells = 500, balanced = TRUE)
+indrop.combined <- FindNeighbors(indrop.combined, dims = 1:30)
+indrop.combined <- FindClusters(indrop.combined, dims = 1:30)
+indrop.combined <- RunTSNE(indrop.combined, dims = 1:30, verbose = FALSE)
+table(Idents(indrop.combined))
+#write_rds(indrop.combined, path = "/data/langenau/yan_indrop/indrop.combined_seurat.07082019.rds")
+write_rds(indrop.combined, path = "/data/langenau/yan_indrop/indrop.combined_seurat_with_prkdc.09182019.rds")
+indrop.combined <- read_rds(path = "/data/langenau/yan_indrop/indrop.combined_seurat_with_prkdc.09182019.rds")
+
+#indrop.combined <- RunUMAP(indrop.combined, dims = 1:30, verbose = FALSE)
+
+TSNEPlot(indrop.combined, group.by="genotype")
+TSNEPlot(indrop.combined, group.by="ident", label=TRUE)
+```
+
+```{r check gene expression on tSNE}
+FeaturePlot(indrop.combined, "gapdh")
+FeaturePlot(indrop.combined, "actb1")
+FeaturePlot(indrop.combined, "zeb2b")
+FeaturePlot(indrop.combined, "cd79a")
+FeaturePlot(indrop.combined, "cd4-1")
+FeaturePlot(indrop.combined, "cd8a")
+FeaturePlot(indrop.combined, "grna")
+FeaturePlot(indrop.combined, "lyz")
+FeaturePlot(indrop.combined, "lygl1")
+FeaturePlot(indrop.combined, "rag1")
+FeaturePlot(indrop.combined, "ighv1-4")
+FeaturePlot(indrop.combined, "blnk")
+FeaturePlot(indrop.combined, "cd81b")
+FeaturePlot(indrop.combined, "hbaa1")
+FeaturePlot(indrop.combined, "slc22a2")
+FeaturePlot(indrop.combined, "mhc2dab")
+FeaturePlot(indrop.combined, "nkl.4")
+FeaturePlot(indrop.combined, "nkl.3")
+FeaturePlot(indrop.combined, "nkl.2")
+FeaturePlot(indrop.combined, "notch1a")
+FeaturePlot(indrop.combined, "nCount_RNA")
+FeaturePlot(indrop.combined, "percent.mt")
+FeaturePlot(indrop.combined, "themis")
+FeaturePlot(indrop.combined, "zap70", label=TRUE)
+FeaturePlot(indrop.combined, "tox", label=TRUE)
+
+indrop.combined@meta.data %>% 
+  dplyr::count(genotype, seurat_clusters) %>% 
+  write_tsv("/data/langenau/yan_indrop/cell_counts_by_genotype_and_cluster.tsv")
+
+
+pdf("/data/langenau/yan_indrop/tSNE_all.pdf", width=8, height=6, onefile = TRUE)
+TSNEPlot(indrop.combined,  group.by="genotype")
+TSNEPlot(indrop.combined, label=TRUE)
+FeaturePlot(indrop.combined, "cd79a", label = TRUE)
+FeaturePlot(indrop.combined, "ighv1-4", label = TRUE)
+FeaturePlot(indrop.combined, "ighz", label = TRUE)
+FeaturePlot(indrop.combined, "blnk", label = TRUE)
+FeaturePlot(indrop.combined, "CD37", label = TRUE)
+
+FeaturePlot(indrop.combined, "il7r", label = TRUE)
+FeaturePlot(indrop.combined, "themis", label = TRUE)
+FeaturePlot(indrop.combined, "tox", label = TRUE)
+FeaturePlot(indrop.combined, "zap70", label = TRUE)
+FeaturePlot(indrop.combined, "cd4-1", label = TRUE)
+FeaturePlot(indrop.combined, "cd8a", label = TRUE)
+FeaturePlot(indrop.combined, "nkl.2", label = TRUE)
+FeaturePlot(indrop.combined, "nkl.3", label = TRUE)
+FeaturePlot(indrop.combined, "nkl.4", label = TRUE)
+dev.off()
+
+pdf("/data/langenau/yan_indrop/tSNE_by_genotype_NOTUSED.pdf", width=8, height=6, onefile = TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "WT"], label=TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "prkdc"], label=TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "il2rga"], label=TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "prkdc_il2rga"], label=TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "rag2"], label=TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "rag2il2rga"], label=TRUE)
+
+dev.off()
+
+
+FeaturePlot(object = indrop.combined, features = "PC_1")
+
+
+cluster.markers <- FindAllMarkers(indrop.combined, min.pct = 0.10)
+View(cluster.markers)
+
+cluster_marker_16 <- FindMarkers(indrop.combined, ident.1 = 16 )
+
+library(Seurat)
+
+genes_to_check <- c("rag1",
+                    "CD37",
+                    "igic1s1",
+                    "cd79a",
+                    "cd79b",
+                    "ighz", 
+                    "pax5",
+                    "igl2v2", 
+                    "rag2",
+                    "il2rga",
+                    "h2afx",
+                    "cd82a",
+                    "foxo1b",
+                    "syk",
+                    "blnk",
+                    "ighv1-4",
+                    "zeb2b",
+                    "actb1",
+                    "lyz",
+                    "nccrp1",
+                    "mpx",
+                    "cebpa", 
+                    #"cebpe", #not available
+                    "cpa5",
+                    "mmp13a",
+                    "zbtb32",
+                    "nkl.2",
+                    "ccl38.6",
+                    "il2rb",
+                    "jak3",
+                    "nkl.4",
+                    "prf1.8",
+                    "il7r",
+                    "lck",
+                    "themis",
+                    "zap70",
+                    "bcl11ba",
+                    "cd4-1",
+                    "cd8a",
+                    "rag2", 
+                    #"zpfm1", #not available
+                    "tal1",
+                    "mef2aa",
+                    "zeb2a",
+                    "meis1b", 
+                    "gata1a",
+                    "mpl" ,
+                    "gata2b",
+                    "hbaa1",
+                    "slc22a2")
+expressions <- FetchData(object = indrop.combined, vars = genes_to_check)
+
+indrop.combined@meta.data %>% tibble::rownames_to_column(var="cellid") %>%
+  inner_join(expressions %>% tibble::rownames_to_column(var="cellid"), by = "cellid") %>% 
+  select(cellid, genotype, genes_to_check ) %>% 
+  melt() %>% 
+  mutate("expressed" = value > 0) %>% 
+  group_by(genotype, variable) %>%
+  summarize(total_cells = n(), expressing = sum(expressed)) %>%
+  mutate("percent_expressing" = 100*expressing/total_cells) %>% 
+  dcast(variable ~ genotype, value.var="percent_expressing") %>% 
+  select(gene = variable, WT, prkdc, il2rga, prkdc_il2rga, rag2, rag2il2rga) %>%
+  write.xlsx2(file = "/data/langenau/yan_indrop/table_percent_expressing_with_prkdc.xlsx", col.names = TRUE)
+  
+
+  
+#### Check with Qin's data ####
+  
+load("/data/langenau/singlecell_prkdc/post_tsne.Robj")
+old_data <- seurat_all@data
+rownames(old_data)
+colnames(old_data)
+
+old_data["rag1","bcBGTB:WT_3"]
+new_data <- GetAssayData(indrop.combined, "data")
+new_data["rag1","bcBGTB_2"]
+
+
+old_data_counts <- seurat_all@raw.data
+new_data_counts <- GetAssayData(indrop.combined, "counts")
+old_data_counts["rag1","bcBGTB:WT_3"]
+new_data_counts["rag1","bcBGTB_2"]
+
+all_rag1_old_wt <- grep("WT", colnames(old_data), value = TRUE)
+all_rag1_old_wt <-  grep("WT_2", all_rag1_old_wt, value = TRUE, invert = TRUE)
+length(all_rag1_old_wt)
+
+100*sum(old_data["syk", all_rag1_old_wt] > 1)/length(all_rag1_old_wt) # 20.24793
+100*sum(old_data["blnk", all_rag1_old_wt] > 1)/length(all_rag1_old_wt) # 8.471074
+100*sum(old_data["lyz", all_rag1_old_wt] > 1)/length(all_rag1_old_wt) #36.23967
+100*sum(old_data["slc22a2", all_rag1_old_wt] > 1)/length(all_rag1_old_wt) #5.123967
+100*sum(old_data["cd79a", all_rag1_old_wt] > 1)/length(all_rag1_old_wt) # 2.768595
+100*sum(old_data["ighv1.4", all_rag1_old_wt] > 1)/length(all_rag1_old_wt) #6.404959
+
+sum(old_data["cd79b", all_rag1_old_wt] > 0)
+
+
+```
+
+
+```{r setup2 with new data from Yan 10/2019, include=FALSE}
+library(readr)
+library(dplyr)
+library(Seurat)
+library(data.table)
+library(useful)
+
+
+wt_rep2.data <- t(as.data.frame(fread("zcat /data/langenau/yan_indrop/indrops_out/WT_rep2/WT_rep2yan_indrop..counts.tsv.gz")))
+colnames(wt_rep2.data) <- wt_rep2.data[1,]
+wt_rep2.data <- wt_rep2.data[-1,]
+
+
+class(wt_rep2.data) <- "numeric"
+corner(wt_rep2.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+wt_rep2 <- CreateSeuratObject(counts = wt_rep2.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+wt_rep2@meta.data$genotype <- "WT"
+wt_rep2@meta.data$rep <- "rep2"
+wt_rep2@meta.data$samplename <- "WT_rep2"
+
+rag2_rep2.data <- t(as.data.frame(fread("zcat /data/langenau/yan_indrop/indrops_out/rag2_rep2/rag2_rep2yan_indrop..counts.tsv.gz")))
+colnames(rag2_rep2.data) <- rag2_rep2.data[1,]
+rag2_rep2.data <- rag2_rep2.data[-1,]
+
+class(rag2_rep2.data) <- "numeric"
+corner(rag2_rep2.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+rag2_rep2 <- CreateSeuratObject(counts = rag2_rep2.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+rag2_rep2@meta.data$genotype <- "rag2"
+rag2_rep2@meta.data$rep <- "rep2"
+rag2_rep2@meta.data$samplename <- "rag2_rep2"
+
+rag2il2rga_rep2.data <- t(as.data.frame(fread("zcat /data/langenau/yan_indrop/indrops_out/rag2il2rga_rep2/rag2il2rga_rep2yan_indrop..counts.tsv.gz")))
+colnames(rag2il2rga_rep2.data) <- rag2il2rga_rep2.data[1,]
+rag2il2rga_rep2.data <- rag2il2rga_rep2.data[-1,]
+
+class(rag2il2rga_rep2.data) <- "numeric"
+corner(rag2il2rga_rep2.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+rag2il2rga_rep2 <- CreateSeuratObject(counts = rag2il2rga_rep2.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+rag2il2rga_rep2@meta.data$genotype <- "rag2il2rga"
+rag2il2rga_rep2@meta.data$rep <- "rep2"
+rag2il2rga_rep2@meta.data$samplename <- "rag2il2rga_rep2"
+
+#indrop.combined <- merge(wt_rep2, y = rag2_rep2,  project = "yan_indrop")
+indrop.combined <- merge(indrop.combined, y = rag2il2rga_rep2,  project = "yan_indrop")
+indrop.combined <- merge(indrop.combined, y = wt_rep2,  project = "yan_indrop")
+indrop.combined <- merge(indrop.combined, y = rag2_rep2,  project = "yan_indrop")
+dplyr::count(indrop.combined@meta.data, genotype, rep)
+
+
+# wt_rep2.data <- t(as.data.frame(fread("zcat /data/langenau/yan_indrop/indrops_out_L134/wt_rep2/wt_rep2yan_indrop..counts.tsv.gz")))
+# colnames(wt_rep2.data) <- wt_rep2.data[1,]
+# wt_rep2.data <- wt_rep2.data[-1,]
+# 
+# 
+# class(wt_rep2.data) <- "numeric"
+# corner(wt_rep2.data)
+# # Initialize the Seurat object with the raw (non-normalized data).
+# wt_rep2 <- CreateSeuratObject(counts = wt_rep2.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+# wt_rep2@meta.data$genotype <- "WT"
+# wt_rep2@meta.data$rep <- "rep1"
+# wt_rep2@meta.data$samplename <- "wt_rep2"
+
+
+
+
+
+#write_rds(indrop.combined, path = "/data/langenau/yan_indrop/indrop.combined.WITH_REP1_and_REP3.07222019.rds")
+#write_rds(indrop.combined, path = "/data/langenau/yan_indrop/indrop.combined.qin_and_yan_all_reps.11112019.rds")
+
+
+
+#indrop.combined
+dim(indrop.combined@meta.data)
+table(indrop.combined@meta.data$genotype)
+
+indrop.combined@meta.data %>%
+  ggplot(aes(x=genotype, y=nFeature_RNA)) + geom_boxplot()
+
+indrop.combined[["percent.mt"]] <- PercentageFeatureSet(indrop.combined, pattern = "^mt-")
+VlnPlot(indrop.combined, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+indrop.combined <- NormalizeData(indrop.combined, normalization.method = "LogNormalize", scale.factor = 10000)
+
+indrop.combined <- FindVariableFeatures(indrop.combined, selection.method = "vst", nfeatures = 2000)
+top10 <- head(VariableFeatures(indrop.combined), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(indrop.combined)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+
+
+
+indrop.combined <- ScaleData(indrop.combined, vars.to.regress = c("percent.mt","nFeature_RNA", "nCount_RNA"))
+indrop.combined <- RunPCA(indrop.combined, verbose = FALSE)
+ElbowPlot(indrop.combined, ndims = 50)
+
+PCAPlot(indrop.combined, group.by="genotype")
+DimHeatmap(indrop.combined, dims = 1:5, cells = 500, balanced = TRUE)
+indrop.combined <- FindNeighbors(indrop.combined, dims = 1:30)
+indrop.combined <- FindClusters(indrop.combined, dims = 1:30)
+indrop.combined <- RunTSNE(indrop.combined, dims = 1:30, verbose = FALSE)
+table(Idents(indrop.combined))
+#write_rds(indrop.combined, path = "/data/langenau/yan_indrop/indrop.combined_seurat.07082019.rds")
+#write_rds(indrop.combined, path = "/data/langenau/yan_indrop/indrop.combined_seurat_with_prkdc.09182019.rds")
+#indrop.combined <- read_rds(path = "/data/langenau/yan_indrop/indrop.combined_seurat_with_prkdc.09182019.rds")
+
+#indrop.combined <- RunUMAP(indrop.combined, dims = 1:30, verbose = FALSE)
+
+TSNEPlot(indrop.combined, group.by="genotype")
+TSNEPlot(indrop.combined, group.by="rep")
+TSNEPlot(indrop.combined, group.by="ident", label=TRUE)
+
+FeaturePlot(indrop.combined, features = "cd4-1", cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "WT"])
+FeaturePlot(indrop.combined, "cd79a")
+FeaturePlot(indrop.combined, "cd8a")
+FeaturePlot(indrop.combined, "grna")
+FeaturePlot(indrop.combined, "lyz")
+FeaturePlot(indrop.combined, "lygl1")
+FeaturePlot(indrop.combined, "rag1")
+FeaturePlot(indrop.combined, "ighv1-4", label = TRUE)
+FeaturePlot(indrop.combined, "blnk")
+FeaturePlot(indrop.combined, "cd81b")
+FeaturePlot(indrop.combined, "hbaa1")
+FeaturePlot(indrop.combined, "nkl.4")
+FeaturePlot(indrop.combined, "nkl.3", label = TRUE)
+FeaturePlot(indrop.combined, "nkl.2")
+FeaturePlot(indrop.combined, "notch1a")
+FeaturePlot(indrop.combined, "themis")
+FeaturePlot(indrop.combined, "zap70")
+FeaturePlot(indrop.combined, "tox")
+FeaturePlot(indrop.combined, "il7r")
+#15 and 17 are B cell clusters, 12 is T cell cluster.
+
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "WT" & indrop.combined@meta.data$rep == "rep2"], label=TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "rag2" & indrop.combined@meta.data$rep == "rep2"], label=TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "rag2il2rga" & indrop.combined@meta.data$rep == "rep2"], label=TRUE, group.by = "ident")
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "prkdc"], label=TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "il2rga"], label=TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "prkdc_il2rga"], label=TRUE)
+
+
+cluster_markers_9 <- FindMarkers(indrop.combined, ident.1 = 9)
+cluster_markers_12 <- FindMarkers(indrop.combined, ident.1 = 12)
+
+wt_only <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "WT"])
+
+rag2il2rga_only <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "rag2il2rga"])
+
+rag2_only <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "rag2"])
+
+prkdc_only <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "prkdc"])
+
+il2rga_only <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "il2rga"])
+
+prkdcil2rga_only <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "prkdc_il2rga"])
+
+rep2_only <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$rep == "rep2"])
+
+dim(wt_only@assays$RNA)
+FeaturePlot(wt_only, "nkl.4", order = TRUE)
+FeaturePlot(wt_only, "cd79a", order = TRUE)
+FeaturePlot(prkdc_only, "zap70", order = TRUE, label = TRUE)
+FeaturePlot(rep2_only, "cd79a", order = TRUE, label = TRUE)
+
+```
+
+
+
+```{r setup3 with new data from Yan 10/2019, include=FALSE}
+library(readr)
+library(dplyr)
+library(Seurat)
+library(data.table)
+library(useful)
+
+
+wt_rep3.data <- t(as.data.frame(fread("zcat /data/langenau/yan_indrop/indrops_out/WT_rep3/WT_rep3yan_indrop..counts.tsv.gz")))
+colnames(wt_rep3.data) <- wt_rep3.data[1,]
+wt_rep3.data <- wt_rep3.data[-1,]
+
+
+class(wt_rep3.data) <- "numeric"
+corner(wt_rep3.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+wt_rep3 <- CreateSeuratObject(counts = wt_rep3.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+wt_rep3@meta.data$genotype <- "WT"
+wt_rep3@meta.data$rep <- "rep3"
+wt_rep3@meta.data$samplename <- "WT_rep3"
+
+rag2_rep3.data <- t(as.data.frame(fread("zcat /data/langenau/yan_indrop/indrops_out/rag2_rep3/rag2_rep3yan_indrop..counts.tsv.gz")))
+colnames(rag2_rep3.data) <- rag2_rep3.data[1,]
+rag2_rep3.data <- rag2_rep3.data[-1,]
+
+class(rag2_rep3.data) <- "numeric"
+corner(rag2_rep3.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+rag2_rep3 <- CreateSeuratObject(counts = rag2_rep3.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+rag2_rep3@meta.data$genotype <- "rag2"
+rag2_rep3@meta.data$rep <- "rep3"
+rag2_rep3@meta.data$samplename <- "rag2_rep3"
+
+rag2il2rga_rep3.data <- t(as.data.frame(fread("zcat /data/langenau/yan_indrop/indrops_out/rag2il2rga_rep3/rag2il2rga_rep3yan_indrop..counts.tsv.gz")))
+colnames(rag2il2rga_rep3.data) <- rag2il2rga_rep3.data[1,]
+rag2il2rga_rep3.data <- rag2il2rga_rep3.data[-1,]
+
+class(rag2il2rga_rep3.data) <- "numeric"
+corner(rag2il2rga_rep3.data)
+# Initialize the Seurat object with the raw (non-normalized data).
+rag2il2rga_rep3 <- CreateSeuratObject(counts = rag2il2rga_rep3.data, project = "yan_indrop", min.cells = 3, min.features = 200)
+rag2il2rga_rep3@meta.data$genotype <- "rag2il2rga"
+rag2il2rga_rep3@meta.data$rep <- "rep3"
+rag2il2rga_rep3@meta.data$samplename <- "rag2il2rga_rep3"
+
+#indrop.combined <- merge(wt_rep3, y = rag2_rep3,  project = "yan_indrop")
+indrop.combined <- merge(indrop.combined, y = rag2il2rga_rep3,  project = "yan_indrop")
+indrop.combined <- merge(indrop.combined, y = wt_rep3,  project = "yan_indrop")
+indrop.combined <- merge(indrop.combined, y = rag2_rep3,  project = "yan_indrop")
+dplyr::count(indrop.combined@meta.data, genotype, rep)
+
+
+
+#write_rds(indrop.combined, path = "/data/langenau/yan_indrop/indrop.combined.qin_and_yan_all_reps.11172019.rds")
+
+
+
+#indrop.combined
+dim(indrop.combined@meta.data)
+table(indrop.combined@meta.data$genotype)
+
+indrop.combined@meta.data %>%
+  ggplot(aes(x=genotype, y=nFeature_RNA)) + geom_boxplot()
+
+indrop.combined[["percent.mt"]] <- PercentageFeatureSet(indrop.combined, pattern = "^mt-")
+VlnPlot(indrop.combined, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+indrop.combined <- NormalizeData(indrop.combined, normalization.method = "LogNormalize", scale.factor = 10000)
+
+indrop.combined <- FindVariableFeatures(indrop.combined, selection.method = "vst", nfeatures = 2000)
+top10 <- head(VariableFeatures(indrop.combined), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(indrop.combined)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+
+
+
+indrop.combined <- ScaleData(indrop.combined, vars.to.regress = c("percent.mt","nFeature_RNA", "nCount_RNA"))
+indrop.combined <- RunPCA(indrop.combined, verbose = FALSE)
+ElbowPlot(indrop.combined, ndims = 50)
+
+PCAPlot(indrop.combined, group.by="genotype")
+DimHeatmap(indrop.combined, dims = 1:5, cells = 500, balanced = TRUE)
+indrop.combined <- FindNeighbors(indrop.combined, dims = 1:30)
+indrop.combined <- FindClusters(indrop.combined, dims = 1:30)
+indrop.combined <- RunTSNE(indrop.combined, dims = 1:30, verbose = FALSE)
+table(Idents(indrop.combined))
+#write_rds(indrop.combined, path = "/data/langenau/yan_indrop/indrop.combined_seurat.07082019.rds")
+#write_rds(indrop.combined, path = "/data/langenau/yan_indrop/indrop.combined_seurat_with_prkdc.09182019.rds")
+#indrop.combined <- read_rds(path = "/data/langenau/yan_indrop/indrop.combined_seurat_with_prkdc.09182019.rds")
+
+#indrop.combined <- RunUMAP(indrop.combined, dims = 1:30, verbose = FALSE)
+
+TSNEPlot(indrop.combined, group.by="genotype")
+TSNEPlot(indrop.combined, group.by="rep")
+TSNEPlot(indrop.combined, group.by="ident", label=TRUE)
+
+FeaturePlot(indrop.combined, features = "cd4-1")
+FeaturePlot(indrop.combined, "cd79a", label = TRUE)
+FeaturePlot(indrop.combined, "cd8a", label = TRUE)
+FeaturePlot(indrop.combined, "grna", label = TRUE)
+FeaturePlot(indrop.combined, "lyz", label = TRUE)
+FeaturePlot(indrop.combined, "lygl1", label = TRUE)
+FeaturePlot(indrop.combined, "rag1", label = TRUE) #12
+FeaturePlot(indrop.combined, "bcl11aa", label = TRUE) 
+FeaturePlot(indrop.combined, "syk", label = TRUE) #12
+FeaturePlot(indrop.combined, "flt3", label = TRUE) 
+FeaturePlot(indrop.combined, "xbp1", label = TRUE) #12
+FeaturePlot(indrop.combined, "CD37", label = TRUE) #16
+FeaturePlot(indrop.combined, "ighv1-4", label = TRUE)
+FeaturePlot(indrop.combined, "blnk", label = TRUE)
+FeaturePlot(indrop.combined, "cd81b", label = TRUE)
+FeaturePlot(indrop.combined, "cd81a", label = TRUE)
+FeaturePlot(indrop.combined, "hbaa1", label = TRUE)
+FeaturePlot(indrop.combined, "nkl.4", label = TRUE)
+FeaturePlot(indrop.combined, "nkl.3", label = TRUE) #9
+FeaturePlot(indrop.combined, "nkl.2", label = TRUE)
+FeaturePlot(indrop.combined, "notch1a", label = TRUE)
+FeaturePlot(indrop.combined, "themis", label = TRUE)
+FeaturePlot(indrop.combined, "zap70", label = TRUE)
+FeaturePlot(indrop.combined, "tox", label = TRUE)
+FeaturePlot(indrop.combined, "il7r", label = TRUE)
+FeaturePlot(indrop.combined, "lck", label = TRUE)
+#16 and 12 are B cell clusters (only 12 is positive for rag1), 9 is T cell cluster.
+
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "WT"], label=TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "rag2"], label=TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "rag2il2rga"], label=TRUE, group.by = "ident")
+table(indrop.combined@meta.data$genotype)
+
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "prkdc"], label=TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "il2rga"], label=TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "prkdc_il2rga"], label=TRUE)
+
+
+cluster_markers_9 <- FindMarkers(indrop.combined, ident.1 = 9)
+cluster_markers_12 <- FindMarkers(indrop.combined, ident.1 = 12, ident.2 = 16)
+cluster_markers_16 <- FindMarkers(indrop.combined, ident.1 = 16, ident.2 = 12)
+
+wt_only <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "WT"])
+
+rag2il2rga_only <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "rag2il2rga"])
+
+rag2_only <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "rag2"])
+
+prkdc_only <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "prkdc"])
+
+il2rga_only <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "il2rga"])
+
+prkdcil2rga_only <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "prkdc_il2rga"])
+
+rep3_only <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$rep == "rep3"])
+
+dim(wt_only@assays$RNA)
+FeaturePlot(wt_only, "nkl.4", order = TRUE)
+FeaturePlot(wt_only, "cd79a", order = TRUE)
+FeaturePlot(prkdc_only, "zap70", order = TRUE, label = TRUE)
+FeaturePlot(rep3_only, "cd79a", order = TRUE, label = TRUE)
+
+
+# try breaking up cluster 9
+cluster_9_only_cellnames <- rownames(indrop.combined@meta.data)[indrop.combined@meta.data$RNA_snn_res.0.8 == 9]
+raw_data_cluster_9 <- GetAssayData(indrop.combined, slot="counts")[,cluster_9_only_cellnames]
+dim(raw_data_cluster_9)
+
+cluster_9 <- CreateSeuratObject(counts = raw_data_cluster_9, project = "yan_indrop_Tcells", min.cells = 3, min.features = 200)
+cluster_9@meta.data$genotype <- indrop.combined@meta.data[rownames(cluster_9@meta.data), "genotype"]
+cluster_9@meta.data$rep <- indrop.combined@meta.data[rownames(cluster_9@meta.data), "rep"]
+
+cluster_9 <- NormalizeData(cluster_9, normalization.method = "LogNormalize", scale.factor = 10000)
+
+cluster_9 <- FindVariableFeatures(cluster_9, selection.method = "vst", nfeatures = 2000)
+top10 <- head(VariableFeatures(cluster_9), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(cluster_9)
+
+
+cluster_9 <- ScaleData(cluster_9, vars.to.regress = c("percent.mt","nFeature_RNA", "nCount_RNA"))
+cluster_9 <- RunPCA(cluster_9, verbose = FALSE)
+
+
+PCAPlot(cluster_9)
+
+cluster_9 <- FindNeighbors(cluster_9, dims = 1:30)
+cluster_9 <- FindClusters(cluster_9, dims = 1:30)
+cluster_9 <- RunTSNE(cluster_9, dims = 1:30, verbose = FALSE)
+
+
+TSNEPlot(cluster_9)
+
+TSNEPlot(cluster_9, cells = rownames(cluster_9@meta.data)[cluster_9@meta.data$genotype == "WT"], label=TRUE)
+TSNEPlot(cluster_9, cells = rownames(cluster_9@meta.data)[cluster_9@meta.data$genotype == "rag2"], label=TRUE)
+TSNEPlot(cluster_9, cells = rownames(cluster_9@meta.data)[cluster_9@meta.data$genotype == "rag2il2rga"], label=TRUE, group.by = "ident")
+table(cluster_9@meta.data$genotype)
+
+
+FeaturePlot(cluster_9, "nkl.4", label = TRUE)
+FeaturePlot(cluster_9, "nkl.3", label = TRUE) #9
+FeaturePlot(cluster_9, "nkl.2", label = TRUE)
+FeaturePlot(cluster_9, "notch1a", label = TRUE)
+FeaturePlot(cluster_9, "themis", label = TRUE)
+FeaturePlot(cluster_9, "zap70", label = TRUE)
+FeaturePlot(cluster_9, "tox", label = TRUE)
+FeaturePlot(cluster_9, "il7r", label = TRUE)
+FeaturePlot(cluster_9, "ccl38.6", label = TRUE)
+
+# control
+FeaturePlot(cluster_9, "lyz", label = TRUE)
+FeaturePlot(cluster_9, "hbaa1", label = TRUE)
+
+
+pdf("/data/langenau/yan_indrop/tSNE_and_pies.pdf", width = 8, height = 6)
+TSNEPlot(indrop.combined, group.by="ident", label=TRUE)
+FeaturePlot(indrop.combined, "rag1", label = TRUE) #12
+
+FeaturePlot(indrop.combined, "CD37", label = TRUE) #16
+FeaturePlot(indrop.combined, "nkl.4", label = TRUE)
+FeaturePlot(indrop.combined, "nkl.3", label = TRUE) #9
+FeaturePlot(indrop.combined, "nkl.2", label = TRUE)
+FeaturePlot(indrop.combined, "themis", label = TRUE)
+FeaturePlot(indrop.combined, "zap70", label = TRUE)
+FeaturePlot(indrop.combined, "ccl38.6", label = TRUE)
+FeaturePlot(indrop.combined, "tox", label = TRUE)
+FeaturePlot(indrop.combined, "il7r", label = TRUE)
+FeaturePlot(indrop.combined, "lck", label = TRUE)
+
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "WT"], label=TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "rag2"], label=TRUE)
+TSNEPlot(indrop.combined, cells = rownames(indrop.combined@meta.data)[indrop.combined@meta.data$genotype == "rag2il2rga"], label=TRUE, group.by = "ident")
+
+indrop.combined@meta.data %>%
+  mutate(annotated_celltype = case_when(RNA_snn_res.0.8 == 16 ~ "mature B cells",
+                                        RNA_snn_res.0.8 == 12 ~ "immature B cells",
+                                        RNA_snn_res.0.8 == 9 ~ "T cells",
+                                        TRUE ~ "other")) -> metadata_annotated
+
+
+wt_annotations <- table(metadata_annotated$annotated_celltype[metadata_annotated$genotype == "WT"])
+rag2_annotations <- table(metadata_annotated$annotated_celltype[metadata_annotated$genotype == "rag2"])
+rag2il2rga_annotations <- table(metadata_annotated$annotated_celltype[metadata_annotated$genotype == "rag2il2rga"])
+
+ggplot(as.data.frame(wt_annotations), aes(x = "", y = Freq, fill = Var1)) + 
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y", start=0) + theme_bw() +
+  theme(axis.text.x = element_blank(), panel.grid = element_blank()) +
+  scale_fill_manual(values = c("blue", "red", "lightgray", "green")) + xlab("") + ylab("")
+
+ggplot(as.data.frame(rag2_annotations), aes(x = "", y = Freq, fill = Var1)) + 
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y", start=0) + theme_bw() +
+  theme(axis.text.x = element_blank(), panel.grid = element_blank()) +
+  scale_fill_manual(values = c("blue", "red", "lightgray", "green")) + xlab("") + ylab("")
+
+ggplot(as.data.frame(rag2il2rga_annotations), aes(x = "", y = Freq, fill = Var1)) + 
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y", start=0) + theme_bw() +
+  theme(axis.text.x = element_blank(), panel.grid = element_blank()) +
+  scale_fill_manual(values = c("blue", "red", "lightgray", "green")) + xlab("") + ylab("")
+  
+dev.off()
+```
+
+
+```{r try new Seurat integration}
+indrops.list <- SplitObject(indrop.combined, split.by = "rep")
+
+for (i in 1:length(indrops.list)) {
+    indrops.list[[i]] <- NormalizeData(indrops.list[[i]], verbose = FALSE)
+    indrops.list[[i]] <- FindVariableFeatures(indrops.list[[i]], selection.method = "vst", 
+        nfeatures = 2000, verbose = FALSE)
+}
+indrops.anchors <- FindIntegrationAnchors(object.list = indrops.list, dims = 1:30)
+
+indrops.integrated <- IntegrateData(anchorset = indrops.anchors, dims = 1:30)
+
+
+indrops.integrated <- ScaleData(indrops.integrated, verbose = FALSE)
+indrops.integrated <- RunPCA(indrops.integrated, npcs = 30, verbose = FALSE)
+indrops.integrated <- RunTSNE(indrops.integrated, reduction = "pca", dims = 1:30)
+DimPlot(indrops.integrated, reduction = "tsne", group.by = "rep")
+
+TSNEPlot(indrops.integrated, cells = rownames(indrops.integrated@meta.data)[indrops.integrated@meta.data$genotype == "rag2"], label=TRUE, group.by = "rep")
+TSNEPlot(indrops.integrated, cells = rownames(indrops.integrated@meta.data)[indrops.integrated@meta.data$genotype == "rag2il2rga"], label=TRUE, group.by = "rep")
+
+```
+
+```{r yan only subset CURRENTLY USED}
+
+#indrops_new <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[!indrop.combined@meta.data$genotype %in% c("prkdc" ,"il2rga","prkdc_il2rga") & !indrop.combined@meta.data$rep %in% c("qinrep1","qinrep3")])
+indrops_new <- subset(indrop.combined, cells = rownames(indrop.combined@meta.data)[!indrop.combined@meta.data$genotype %in% c("prkdc" ,"il2rga","prkdc_il2rga")])
+dim(indrops_new@meta.data)
+indrops_new <- NormalizeData(indrops_new, normalization.method = "LogNormalize", scale.factor = 10000)
+min(indrops_new@meta.data$nFeature_RNA)
+
+table(indrops_new@meta.data$genotype)
+
+indrops_new <- FindVariableFeatures(indrops_new, selection.method = "vst", nfeatures = 2000)
+
+
+indrops_new <- ScaleData(indrops_new, vars.to.regress = c("percent.mt","nFeature_RNA", "nCount_RNA"))
+indrops_new <- RunPCA(indrops_new, verbose = FALSE)
+ElbowPlot(indrops_new, ndims = 20)
+
+PCAPlot(indrops_new, group.by="genotype")
+DimHeatmap(indrops_new, dims = 1:5, cells = 500, balanced = TRUE)
+indrops_new <- FindNeighbors(indrops_new, dims = 1:20)
+indrops_new <- FindClusters(indrops_new, dims = 1:20)
+indrops_new <- RunTSNE(indrops_new, dims = 1:20, verbose = FALSE)
+
+TSNEPlot(indrops_new, group.by = "rep")
+FeaturePlot(indrops_new, features = "cd4-1", label = TRUE)
+
+FeaturePlot(indrops_new, "cd8a", label = TRUE)
+FeaturePlot(indrops_new, "grna", label = TRUE)
+FeaturePlot(indrops_new, "lyz", label = TRUE)
+FeaturePlot(indrops_new, "lygl1", label = TRUE)
+
+
+FeaturePlot(indrops_new, "cd81b", label = TRUE) #15
+FeaturePlot(indrops_new, "cd81a", label = TRUE) #non-specific
+FeaturePlot(indrops_new, "hbaa1", label = TRUE)
+
+
+FeaturePlot(indrops_new, "ighv1-4", label = TRUE) #19 and 20
+FeaturePlot(indrops_new, "cd79a", label = TRUE) #19 and 20
+FeaturePlot(indrops_new, "pax5", label = TRUE) 
+FeaturePlot(indrops_new, "rag1", label = TRUE) #19
+FeaturePlot(indrops_new, "CD37", label = TRUE) #20
+FeaturePlot(indrops_new, "igl2v2", label = TRUE)#20
+FeaturePlot(indrops_new, "ighz", label = TRUE)
+FeaturePlot(indrops_new, "zeb2b", label = TRUE)
+
+FeaturePlot(indrops_new, "zbtb32", label = TRUE) #8
+FeaturePlot(indrops_new, "themis", label = TRUE) #8
+FeaturePlot(indrops_new, "zap70", label = TRUE)#8
+FeaturePlot(indrops_new, "tox", label = TRUE)#8
+FeaturePlot(indrops_new, "nkl.4", label = TRUE)#8
+FeaturePlot(indrops_new, "nkl.3", label = TRUE)#8
+FeaturePlot(indrops_new, "nkl.2", label = TRUE)#8
+FeaturePlot(indrops_new, "lck", label = TRUE) #8
+FeaturePlot(indrops_new, "il7r", label = TRUE)
+FeaturePlot(indrops_new, "ccl38.6", label = TRUE) #8
+FeaturePlot(indrops_new, "ccl38a.5", label = TRUE) #8
+
+FeaturePlot(indrops_new, "mpx", label = TRUE)
+FeaturePlot(indrops_new, "mpeg1.1", label = TRUE)
+FeaturePlot(indrops_new, "grn1", label = TRUE)
+FeaturePlot(indrops_new, "hbaa1", label = TRUE)
+
+table(indrops_new@meta.data$genotype)
+
+
+TSNEPlot(indrops_new, cells = rownames(indrops_new@meta.data)[indrops_new@meta.data$genotype == "WT"], label=TRUE)
+TSNEPlot(indrops_new, cells = rownames(indrops_new@meta.data)[indrops_new@meta.data$genotype == "rag2"], label=TRUE)
+TSNEPlot(indrops_new, cells = rownames(indrops_new@meta.data)[indrops_new@meta.data$genotype == "rag2il2rga"], label=TRUE)
+
+# Isolate B-cells
+
+indrops_bcells <- subset(indrops_new, idents = c(19,20))
+indrops_bcells <- NormalizeData(indrops_bcells, normalization.method = "LogNormalize", scale.factor = 10000)
+min(indrops_bcells@meta.data$nFeature_RNA)
+
+table(indrops_bcells@meta.data$genotype)
+
+indrops_bcells <- FindVariableFeatures(indrops_bcells, selection.method = "vst", nfeatures = 2000)
+
+
+indrops_bcells <- ScaleData(indrops_bcells, vars.to.regress = c("percent.mt","nFeature_RNA", "nCount_RNA"))
+indrops_bcells <- RunPCA(indrops_bcells, verbose = FALSE)
+PCAPlot(indrops_bcells)
+ElbowPlot(indrops_bcells, ndims = 20)
+
+PCAPlot(indrops_bcells, group.by="genotype")
+#DimHeatmap(indrops_bcells, dims = 1:5, cells = 500, balanced = TRUE)
+indrops_bcells <- FindNeighbors(indrops_bcells, dims = 1:20)
+indrops_bcells <- FindClusters(indrops_bcells, dims = 1:20)
+indrops_bcells <- RunTSNE(indrops_bcells, dims = 1:10, verbose = FALSE)
+pdf("/data/langenau/yan_indrop/tSNE_and_pies_indrops_bcells.pdf", useDingbats = FALSE, height = 6, width = 8)
+TSNEPlot(indrops_bcells, label = TRUE)
+
+FeaturePlot(subset(indrops_bcells, cells = rownames(indrops_bcells@meta.data)[indrops_bcells@meta.data$genotype == "WT"]), features = "rag1") 
+ 
+
+
+FeaturePlot(subset(indrops_bcells, cells = rownames(indrops_bcells@meta.data)[indrops_bcells@meta.data$genotype == "rag2"]), features = "rag1") 
+
+FeaturePlot(subset(indrops_bcells, cells = rownames(indrops_bcells@meta.data)[indrops_bcells@meta.data$genotype == "rag2il2rga"]), features = "rag1") 
+FeaturePlot(subset(indrops_bcells, cells = rownames(indrops_bcells@meta.data)[indrops_bcells@meta.data$genotype == "WT"]), features = "CD37")
+FeaturePlot(subset(indrops_bcells, cells = rownames(indrops_bcells@meta.data)[indrops_bcells@meta.data$genotype == "rag2"]), features = "CD37") 
+
+FeaturePlot(subset(indrops_bcells, cells = rownames(indrops_bcells@meta.data)[indrops_bcells@meta.data$genotype == "rag2il2rga"]), features = "CD37") 
+
+TSNEPlot(indrops_bcells, cells = rownames(indrops_bcells@meta.data)[indrops_bcells@meta.data$genotype == "WT"], label=TRUE)
+TSNEPlot(indrops_bcells, cells = rownames(indrops_bcells@meta.data)[indrops_bcells@meta.data$genotype == "rag2"], label=TRUE)
+TSNEPlot(indrops_bcells, cells = rownames(indrops_bcells@meta.data)[indrops_bcells@meta.data$genotype == "rag2il2rga"], label=TRUE)
+dev.off()
+
+# Isolate T cells
+indrops_tcells <- subset(indrops_new, idents = c(8))
+indrops_tcells <- NormalizeData(indrops_tcells, normalization.method = "LogNormalize", scale.factor = 10000)
+min(indrops_tcells@meta.data$nFeature_RNA)
+
+table(indrops_tcells@meta.data$genotype)
+
+indrops_tcells <- FindVariableFeatures(indrops_tcells, selection.method = "vst", nfeatures = 2000)
+
+
+indrops_tcells <- ScaleData(indrops_tcells, vars.to.regress = c("percent.mt","nFeature_RNA", "nCount_RNA"))
+indrops_tcells <- RunPCA(indrops_tcells, verbose = FALSE)
+PCAPlot(indrops_tcells)
+ElbowPlot(indrops_tcells, ndims = 20)
+
+PCAPlot(indrops_tcells, group.by="genotype")
+#DimHeatmap(indrops_tcells, dims = 1:5, cells = 500, balanced = TRUE)
+indrops_tcells <- FindNeighbors(indrops_tcells, dims = 1:10)
+indrops_tcells <- FindClusters(indrops_tcells, dims = 1:10, n.start = 100)
+indrops_tcells <- RunTSNE(indrops_tcells, dims = 1:10, verbose = FALSE)
+pdf("/data/langenau/yan_indrop/tSNE_and_pies_indrops_tcells.pdf", useDingbats = FALSE, height = 6, width = 8)
+TSNEPlot(indrops_tcells, label = TRUE)
+
+FeaturePlot(indrops_tcells, features = "ccl38.6") 
+FeaturePlot(indrops_tcells, features = "nkl.2") 
+FeaturePlot(indrops_tcells, features = "nkl.3") 
+FeaturePlot(indrops_tcells, features = "nkl.4") 
+FeaturePlot(indrops_tcells, features = "zap70") 
+FeaturePlot(indrops_tcells, features = "zbtb32") 
+FeaturePlot(indrops_tcells, features = "lck") 
+FeaturePlot(indrops_tcells, features = "cd4-1") 
+FeaturePlot(indrops_tcells, features = "cd8a") 
+FeaturePlot(indrops_tcells, features = "meis1b") 
+FeaturePlot(indrops_tcells, features = "mpx") 
+
+#all_markers <- FindAllMarkers(indrops_tcells)
+
+FeaturePlot(subset(indrops_tcells, cells = rownames(indrops_tcells@meta.data)[indrops_tcells@meta.data$genotype == "rag2il2rga"]), features = "CD37") 
+
+
+dev.off()
+
+marker_gene_list <- c("themis",
+"tox",
+"il7r",
+"bcl11ba",
+"ccl38.6",
+"ccl38a.5",
+"ccl34b.4",
+"il2rb",
+"jak3",
+"prf1.8",
+"nkl.2",
+"nkl.3",
+"nkl.4",
+"ccl33.3",
+"lyz",
+"cpa5",
+"runx1t1",
+"tal1",
+"mef2aa",
+"zeb2a",
+"gata1a",
+"mpl" )
+
+pdf("/data/langenau/yan_indrop/marker_projections_tcells.pdf", height = 6, width = 8)
+tcell_subset_wt <- SubsetData(indrops_tcells, ident.remove = c(4,7), subset.name = "genotype", accept.value = "WT")
+g <- GeoFeaturePlot(tcell_subset_wt, "gapdh", reduction.use = "tsne") 
+
+ggplot(g, aes(x=tSNE_1, y=tSNE_2, col=ident)) + geom_point(size = 2) + theme_bw() + theme(panel.grid = element_blank())  + ggtitle("WT only")
+
+tcell_subset_rag2 <- SubsetData(indrops_tcells, ident.remove = c(4,7), subset.name = "genotype", accept.value = "rag2")
+g <- GeoFeaturePlot(tcell_subset_rag2, "gapdh", reduction.use = "tsne") 
+
+ggplot(g, aes(x=tSNE_1, y=tSNE_2, col=ident)) + geom_point(size = 2) + theme_bw() + theme(panel.grid = element_blank())  + ggtitle("rag2 only")
+
+tcell_subset_rag2il2rga <- SubsetData(indrops_tcells, ident.remove = c(4,7), subset.name = "genotype", accept.value = "rag2il2rga")
+g <- GeoFeaturePlot(tcell_subset_rag2il2rga, "actb1", reduction.use = "tsne") 
+
+ggplot(g, aes(x=tSNE_1, y=tSNE_2, col=ident)) + geom_point(size = 2) + theme_bw() + theme(panel.grid = element_blank())  + ggtitle("rag2il2rga only")
+
+# TSNEPlot(tcell_subset, cells = rownames(tcell_subset@meta.data)[tcell_subset@meta.data$genotype == "WT"], label=TRUE)
+# TSNEPlot(tcell_subset, cells = rownames(tcell_subset@meta.data)[tcell_subset@meta.data$genotype == "rag2"], label=TRUE)
+# TSNEPlot(tcell_subset, cells = rownames(tcell_subset@meta.data)[tcell_subset@meta.data$genotype == "rag2il2rga"], label=TRUE)
+for (marker in marker_gene_list) {
+  if (marker %in% rownames(GetAssayData(indrops_tcells)))
+  {
+    g <- GeoFeaturePlot(tcell_subset, marker, reduction.use = "tsne") %>%
+      ggplot(aes(x=tSNE_1, y = tSNE_2, color = geomean)) + 
+      geom_point(size = 2) + 
+      scale_color_continuous(low = "grey90", high = "purple") +
+      theme_bw() +
+      theme(panel.grid = element_blank())  + ggtitle(marker)
+    print(g)
+  } else {
+    print(marker)
+  }
+}
+
+dev.off()
+
+
+
+pdf("/data/langenau/yan_indrop/tSNE_and_pies_indrops_new.pdf", width = 8, height = 6, useDingbats = FALSE)
+TSNEPlot(indrops_new, group.by="ident", label=TRUE)
+FeaturePlot(indrops_new, "rag1", label = TRUE) #19
+FeaturePlot(indrops_new, "CD37", label = TRUE) #20
+FeaturePlot(indrops_new, "rag2", label = TRUE) 
+
+FeaturePlot(indrops_new, "nkl.4", label = TRUE)
+FeaturePlot(indrops_new, "nkl.3", label = TRUE) 
+FeaturePlot(indrops_new, "nkl.2", label = TRUE)
+FeaturePlot(indrops_new, "themis", label = TRUE)
+FeaturePlot(indrops_new, "zap70", label = TRUE) #8
+FeaturePlot(indrops_new, "ccl38.6", label = TRUE)
+FeaturePlot(indrops_new, "tox", label = TRUE)
+FeaturePlot(indrops_new, "il7r", label = TRUE)
+FeaturePlot(indrops_new, "lck", label = TRUE)
+
+TSNEPlot(indrops_new, cells = rownames(indrops_new@meta.data)[indrops_new@meta.data$genotype == "WT"], label=TRUE)
+TSNEPlot(indrops_new, cells = rownames(indrops_new@meta.data)[indrops_new@meta.data$genotype == "rag2"], label=TRUE)
+TSNEPlot(indrops_new, cells = rownames(indrops_new@meta.data)[indrops_new@meta.data$genotype == "rag2il2rga"], label=TRUE, group.by = "ident")
+
+indrops_new@meta.data %>%
+  mutate(annotated_celltype = case_when(RNA_snn_res.0.8 == 20 ~ "mature B cells",
+                                        RNA_snn_res.0.8 == 19 ~ "immature B cells",
+                                        RNA_snn_res.0.8 == 8 ~ "T cells",
+                                        TRUE ~ "other")) -> metadata_annotated
+
+
+wt_annotations <- table(metadata_annotated$annotated_celltype[metadata_annotated$genotype == "WT"])
+rag2_annotations <- table(metadata_annotated$annotated_celltype[metadata_annotated$genotype == "rag2"])
+rag2il2rga_annotations <- table(metadata_annotated$annotated_celltype[metadata_annotated$genotype == "rag2il2rga"])
+
+ggplot(as.data.frame(wt_annotations), aes(x = "", y = Freq, fill = Var1)) + 
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y", start=0) + theme_bw() +
+  theme(axis.text.x = element_blank(), panel.grid = element_blank(),legend.title = element_blank()) +
+  scale_fill_manual(values = c("blue", "red", "lightgray", "green")) + xlab("") + ylab("")
+
+ggplot(as.data.frame(rag2_annotations), aes(x = "", y = Freq, fill = Var1)) + 
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y", start=0) + theme_bw() +
+  theme(axis.text.x = element_blank(), panel.grid = element_blank(),legend.title = element_blank()) +
+  scale_fill_manual(values = c("blue", "red", "lightgray", "green")) + xlab("") + ylab("")
+
+ggplot(as.data.frame(rag2il2rga_annotations), aes(x = "", y = Freq, fill = Var1)) + 
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar("y", start=0) + theme_bw() +
+  theme(axis.text.x = element_blank(), panel.grid = element_blank(), legend.title = element_blank()) +
+  scale_fill_manual(values = c("blue", "red", "lightgray", "green")) + xlab("") + ylab("")
+  
+dev.off()
+
+```
+
+```{r get upreg genes in each cluster CURRENTLY USED}
+
+TSNEPlot(indrops_new, label=TRUE)
+
+all_markers_pos_and_neg <- FindAllMarkers(indrops_new, logfc.threshold = 0.25)
+all_markers_pos_only <- FindAllMarkers(indrops_new, logfc.threshold = 0.25, only.pos = TRUE)
+
+bcell_cluster1_marker <- FindMarkers(indrops_new, ident.1 = 19, ident.2 = 20, logfc.threshold = 0.25, only.pos = TRUE)
+bcell_cluster2_marker <- FindMarkers(indrops_new, ident.1 = 20, ident.2 = 19, logfc.threshold = 0.25, only.pos = TRUE)
+
+TSNEPlot(indrops_tcells, label = TRUE)
+
+#write_rds(indrops_new, "/data/langenau/yan_indrop/indrops_new_yan_data_only.rds")
+#write_rds(indrops_bcells, "/data/langenau/yan_indrop/indrops_bcells.rds")
+#write_rds(indrops_tcells, "/data/langenau/yan_indrop/indrops_tcells.rds")
+
+#write_rds(all_markers_pos_and_neg, "/data/langenau/yan_indrop/all_markers_pos_and_neg.rds")
+#write_rds(all_markers_pos_only, "/data/langenau/yan_indrop/all_markers_pos_only.rds")
+#write_rds(bcell_cluster1_marker, "/data/langenau/yan_indrop/bcell_cluster1_marker.rds")
+#write_rds(bcell_cluster2_marker, "/data/langenau/yan_indrop/bcell_cluster2_marker.rds")
+
+ 
+all_markers_pos_only %>%
+  mutate("diff_pct" = pct.1 - pct.2) %>%
+  left_join(fish_to_human, by = c("gene" = "Gene")) -> all_markers_pos_only_with_human_genes
+
+all_clusters <- unique(all_markers_pos_only_with_human_genes$cluster)
+for (i in all_clusters) {
+  all_markers_pos_only_with_human_genes %>% 
+    filter(cluster == i) %>%
+    arrange(desc(diff_pct)) %>%
+    write_tsv(paste0("/data/langenau/yan_indrop/markers_cluster_",i,".txt"))
+}
+
+all_markers_tcells <- FindAllMarkers(indrops_tcells, only.pos = TRUE)
+all_markers_tcells %>%
+  mutate("diff_pct" = pct.1 - pct.2) %>%
+  left_join(fish_to_human, by = c("gene" = "Gene")) -> all_markers_tcells_with_human_genes
+
+all_clusters_tcells <- unique(all_markers_tcells_with_human_genes$cluster)
+for (i in all_clusters_tcells) {
+  all_markers_tcells_with_human_genes %>% 
+    filter(cluster == i) %>%
+    arrange(desc(diff_pct)) %>%
+    write_tsv(paste0("/data/langenau/yan_indrop/markers_cluster_t_cells_",i,".txt"))
+}
+
+
+bcell_cluster1_marker %>%
+  tibble::rownames_to_column("gene") %>%
+  mutate("diff_pct" = pct.1 - pct.2) %>%
+  left_join(fish_to_human, by = c("gene" = "Gene"))  %>% 
+  arrange(desc(diff_pct)) %>%
+  write_tsv("/data/langenau/yan_indrop/markers_B_cluster_19_vs_20.txt")
+
+bcell_cluster2_marker %>%
+  tibble::rownames_to_column("gene") %>%
+  mutate("diff_pct" = pct.1 - pct.2) %>%
+  left_join(fish_to_human, by = c("gene" = "Gene"))  %>% 
+  arrange(desc(diff_pct)) %>%
+  write_tsv("/data/langenau/yan_indrop/markers_B_cluster_20_vs_19.txt")
+
+```
+
+
+```{r figures like Qin paper with Dave's annotation and color scheme  CURRENTLY USED}
+library(RColorBrewer)
+mycols_blood <- brewer.pal(name = "Dark2", 8)
+mycols_kidney <- rep("lightgray", 8)
+mycols_undetermined <- "black"
+mycols_all <- c("RBC" = "#CC1125",
+                              "B-cells - Mature" = "#3D7BFA",
+                              "B-cells - Immature" = "lightblue",
+                              "T/NK cells" = "#6D06F2",
+                              "Neutrophil" = "#3F9843",
+                              "Blood Progenitors" = "#928263",
+                              "Macrophage" = "#E6AC24",
+                              "HSCs/Thrombocytes" = "#F244DA",
+                              "B-cell primed progenitors (cycling)" = "magenta",
+                              "Kidney-Mucin+ cells" = "lightgray",
+                              "Kidney-Vascular Endothelium" = "lightgray",
+                              "Kidney progenitors" = "lightgray",
+                              "Kidney-Proximal Tubule" = "lightgray",
+                              "Kidney-Distal Tubule" = "lightgray",
+                              "Liver" = "lightgray")
+
+
+annotations_dave <- readxl::read_excel("/data/langenau/yan_indrop/Cluster Assigments - Manual by Langenau-Aug4,2020.xlsx", col_types = "text") 
+
+pdf("/data/langenau/yan_indrop/tSNE_by_genotype.pdf", width = 6, height = 4)
+g <- GeoFeaturePlot(indrops_new, "gapdh", reduction.use = "tsne")
+
+g %>%
+  filter(genotype == "WT") %>%
+  inner_join(annotations_dave, by = c("seurat_clusters" = "Cluster")) %>%
+  ggplot(aes(x = tSNE_1, y = tSNE_2, col = Assignment)) +
+  geom_point(size = 0.30) +
+  scale_color_manual(values = mycols_all) + 
+  coord_fixed() +
+  theme_bw() +
+  theme(panel.grid = element_blank() , legend.position = "none") +
+  ggtitle("WT")
+
+g %>%
+  filter(genotype == "rag2") %>%
+  inner_join(annotations_dave, by = c("seurat_clusters" = "Cluster")) %>%
+  ggplot(aes(x = tSNE_1, y = tSNE_2, col = Assignment)) +
+  geom_point(size = 0.30) +
+  scale_color_manual(values = mycols_all) + 
+  coord_fixed() +
+  theme_bw() +
+  theme(panel.grid = element_blank() , legend.position = "none") +
+  ggtitle("rag2")
+
+g %>%
+  filter(genotype == "rag2il2rga") %>%
+  inner_join(annotations_dave, by = c("seurat_clusters" = "Cluster")) %>%
+  ggplot(aes(x = tSNE_1, y = tSNE_2, col = Assignment)) +
+  geom_point(size = 0.30) +
+  scale_color_manual(values = mycols_all) + 
+  coord_fixed() +
+  theme_bw() +
+  theme(panel.grid = element_blank(), legend.position = "none") +
+  ggtitle("rag2il2rga")
+
+dev.off()
+
+g %>%
+  inner_join(annotations_dave, by = c("seurat_clusters" = "Cluster")) %>%
+  dplyr::count(Assignment, genotype, seurat_clusters) %>%
+  write_tsv("/data/langenau/yan_indrop/cell_counts.txt")
+
+annotations_dave_tcells <- read_tsv("/data/langenau/yan_indrop/cluster_assignments_tcells.txt", col_types = "cc")
+
+tcell_subset@meta.data %>%
+  inner_join(annotations_dave_tcells, by = c("seurat_clusters" = "Cluster")) %>%
+  dplyr::count(Assignment, genotype, seurat_clusters) %>% 
+  write_tsv("/data/langenau/yan_indrop/cell_counts_tcell.txt")
+
+
+pdf("/data/langenau/yan_indrop/tSNE_by_genotype_tcell_cluster.pdf", width = 6, height = 4)
+
+tcell_subset_wt <- SubsetData(indrops_tcells, ident.remove = c(4,7), subset.name = "genotype", accept.value = "WT")
+g <- GeoFeaturePlot(tcell_subset_wt, "gapdh", reduction.use = "tsne") %>%
+  inner_join(annotations_dave_tcells, by = c("seurat_clusters" = "Cluster")) %>% 
+  ggplot(aes(x = tSNE_1, y = tSNE_2, col = Assignment)) +
+  geom_point(size = 0.30) +
+  scale_color_brewer(palette = "Dark2") + 
+  coord_fixed() +
+  theme_bw() +
+  theme(panel.grid = element_blank() ) +
+  ggtitle("WT only")
+g
+
+tcell_subset_rag2 <- SubsetData(indrops_tcells, ident.remove = c(4,7), subset.name = "genotype", accept.value = "rag2")
+
+g <- GeoFeaturePlot(tcell_subset_rag2, "gapdh", reduction.use = "tsne") %>%
+  inner_join(annotations_dave_tcells, by = c("seurat_clusters" = "Cluster")) %>% 
+  ggplot(aes(x = tSNE_1, y = tSNE_2, col = Assignment)) +
+  geom_point(size = 0.30) +
+  scale_color_brewer(palette = "Dark2") + 
+  coord_fixed() +
+  theme_bw() +
+  theme(panel.grid = element_blank() ) +
+  ggtitle("rag2 only")
+g
+
+tcell_subset_rag2il2rga <- SubsetData(indrops_tcells, ident.remove = c(4,7), subset.name = "genotype", accept.value = "rag2il2rga")
+
+g <- GeoFeaturePlot(tcell_subset_rag2il2rga, "actb1", reduction.use = "tsne") %>%
+  inner_join(annotations_dave_tcells, by = c("seurat_clusters" = "Cluster")) %>% 
+  ggplot(aes(x = tSNE_1, y = tSNE_2, col = Assignment)) +
+  geom_point(size = 0.30) +
+  scale_color_brewer(palette = "Dark2") + 
+  coord_fixed() +
+  theme_bw() +
+  theme(panel.grid = element_blank() ) +
+  ggtitle("rag2il2rga only")
+g
+
+dev.off()
+  
+
+```
+
+
+```{r markers from Qin data  CURRENTLY USED}
+markers_runx_123 <- read_tsv("/data/langenau/yan_indrop/markers_runx_123.txt")
+markers_lck <- read_tsv("/data/langenau/yan_indrop/markers_lck.txt")
+markers_lck_rag1_ko <- read_tsv("/data/langenau/yan_indrop/markers_lck_rag_ko.txt")
+markers_cd41 <- read_tsv("/data/langenau/yan_indrop/markers_cvejic_cd41.txt")
+markers_mpx <- read_tsv("/data/langenau/yan_indrop/markers_mpx.txt")
+markers_rag2 <- read_tsv("/data/langenau/yan_indrop/markers_rag2.txt")
+
+
+ggtable_runx123 <- GeoFeaturePlot(indrops_new, markers_runx_123$`Gene name`, reduction.use = "tsne")
+ggtable_lck <- GeoFeaturePlot(indrops_new, markers_lck$`Gene name`, reduction.use = "tsne")
+ggtable_lck_rag1_ko <- GeoFeaturePlot(indrops_new, markers_lck_rag1_ko$`Gene name`, reduction.use = "tsne")
+ggtable_cd41 <- GeoFeaturePlot(indrops_new, markers_cd41$`Gene name`, reduction.use = "tsne")
+ggtable_mpx <- GeoFeaturePlot(indrops_new, markers_mpx$`Gene name`, reduction.use = "tsne")
+ggtable_rag2 <- GeoFeaturePlot(indrops_new, markers_rag2$`Gene name`, reduction.use = "tsne")
+
+pdf("/data/langenau/yan_indrop/projections_qin_smartseq2_signatures_supptable2.pdf", width=8, height=6)
+TSNEPlot(indrops_new, label=TRUE)
+ggplot(ggtable_runx123 %>% filter(geomean == 0), aes(x=tSNE_1, y = tSNE_2, color = geomean)) + 
+  geom_point(size = 0.1) + 
+  geom_point(data = ggtable_runx123 %>% filter(geomean > 0), size = 0.1) + 
+  scale_color_continuous(low = "grey90", high = "red") +
+  theme_bw() +
+  theme(panel.grid = element_blank()) + ggtitle("Runx123GFP")
+
+ggplot(ggtable_lck %>% filter(geomean == 0), aes(x=tSNE_1, y = tSNE_2, color = geomean)) + 
+  geom_point(size = 0.1) + 
+  geom_point(data = ggtable_lck %>% filter(geomean > 0), size = 0.1) + 
+  scale_color_continuous(low = "grey90", high = "red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())  + ggtitle("lckGFP")
+
+ggplot(ggtable_lck_rag1_ko %>% filter(geomean == 0), aes(x=tSNE_1, y = tSNE_2, color = geomean)) + 
+  geom_point(size = 0.1) + 
+  geom_point(data = ggtable_lck_rag1_ko %>% filter(geomean > 0), size = 0.1) + 
+  scale_color_continuous(low = "grey90", high = "red") +
+  theme_bw() +
+  theme(panel.grid = element_blank()) + ggtitle("lckGFP_rag1_KO")
+
+ggplot(ggtable_mpx %>% filter(geomean == 0), aes(x=tSNE_1, y = tSNE_2, color = geomean)) + 
+  geom_point(size = 0.1) + 
+  geom_point(data = ggtable_mpx %>% filter(geomean > 0), size = 0.1) + 
+  scale_color_continuous(low = "grey90", high = "red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())  + ggtitle("mpx")
+
+ggplot(ggtable_cd41 %>% filter(geomean == 0), aes(x=tSNE_1, y = tSNE_2, color = geomean)) + 
+  geom_point(size = 0.1) + 
+  geom_point(data = ggtable_cd41 %>% filter(geomean > 0), size = 0.1) + 
+  scale_color_continuous(low = "grey90", high = "red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())  + ggtitle("cd41_Cvejic")
+
+ggplot(ggtable_rag2 %>% filter(geomean == 0), aes(x=tSNE_1, y = tSNE_2, color = geomean)) + 
+  geom_point(size = 0.1) + 
+  geom_point(data = ggtable_rag2 %>% filter(geomean > 0), size = 0.1) + 
+  scale_color_continuous(low = "grey90", high = "red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())  + ggtitle("rag2GFP")
+dev.off()
+
+marker_gene_list <- c("fli1a",
+"fli1b",
+"sox4a",
+"sox4b",
+"ebf1a",
+"ebf1b",
+"myb" ,
+"msi1a",
+"msi1b",
+"ikz1",
+"blnk" ,
+"ptp4a3",
+"cxcr4a",
+"cxcr4b",
+"pax5",
+"tnfrsf11a",
+"spry2",
+"sdc4",
+"tuba7l",
+"dnai1.1",
+"kif17")
+
+pdf("/data/langenau/yan_indrop/marker_projections.pdf", height = 6, width = 8)
+for (marker in marker_gene_list) {
+  if (marker %in% rownames(GetAssayData(indrops_new)))
+  {
+    g <- GeoFeaturePlot(indrops_new, marker, reduction.use = "tsne") %>%
+      ggplot(aes(x=tSNE_1, y = tSNE_2, color = geomean)) + 
+      geom_point(size = 0.1) + 
+      geom_point(data = ggtable_rag2 %>% filter(geomean > 0), size = 0.1) + 
+      scale_color_continuous(low = "grey90", high = "red") +
+      theme_bw() +
+      theme(panel.grid = element_blank())  + ggtitle(marker)
+    print(g)
+  }
+}
+
+dev.off()
+pdf("/data/langenau/yan_indrop/marker_projections_qin_indrop_top10.pdf", width = 8, height = 6)
+library(readxl, lib.loc = "/PHShome/si992/R/x86_64-redhat-linux-gnu-library/3.5")
+indrop_qin_markers <- "/data/langenau/yan_indrop/JEM_20170976_TableS3.xlsx"
+for (sheet in excel_sheets(indrop_qin_markers)) {
+  top10_genes <- read_excel(indrop_qin_markers, sheet = sheet) %>% arrange(desc(diff_in_enrichment)) %>% slice(1:10) 
+  cat(sheet,"\n")
+  cat(top10_genes$genename,"\n")
+  
+  genelist <- str_replace_all(top10_genes$genename, pattern="^si\\.", replacement = "si:")
+  genelist <- str_replace_all(genelist, "dkey\\.", replacement = "dkey-")
+  g <- GeoFeaturePlot(indrops_new, genelist, reduction.use = "tsne") %>%
+      ggplot(aes(x=tSNE_1, y = tSNE_2, color = geomean)) + 
+      geom_point(size = 0.1) + 
+      scale_color_continuous(low = "grey90", high = "red") +
+      theme_bw() +
+      theme(panel.grid = element_blank())  + ggtitle(sheet)
+    print(g)
+}
+dev.off()
+
+# ggplot(ggtable_lck, aes(x=tSNE_1, y = tSNE_2, color = geomean > quantile(geomean, 0.9))) + 
+#   geom_point(size = 0.1) + 
+#   scale_color_manual(values = c("grey90","red") ) +
+#   theme_bw() +
+#   theme(panel.grid = element_blank())
+
+```
+
+
+
+
+```{r compare tumor to thymus for Ally NOT USED}
+alex_indrops_ball_tall_round1.08282018 <- read_rds("/data/langenau/alex_indrops_ball_tall/alex_indrops_ball_tall_round1.08282018.rds")
+library(Seurat)
+alex_indrops_ball_tall_round1.08282018 <- UpdateSeuratObject(alex_indrops_ball_tall_round1.08282018)
+TSNEPlot(alex_indrops_ball_tall_round1.08282018, group.by="orig.ident", label = TRUE)
+TSNEPlot(alex_indrops_ball_tall_round1.08282018 , label = TRUE)
+
+markers_tall_vs_thymus <- FindMarkers(alex_indrops_ball_tall_round1.08282018, group.by = "orig.ident", ident.1 = "Tumor_7_2_1", ident.2 = "Thymus_ctl")
+markers_tall_vs_everything <- FindMarkers(alex_indrops_ball_tall_round1.08282018, group.by = "orig.ident", ident.1 = "Tumor_7_2_1")
+
+markers_tall_vs_thymus %>% 
+  tibble::rownames_to_column("gene") %>% 
+  left_join(fish_to_human, by = c("gene" = "Gene")) %>%
+  mutate("diff_in_pct" = pct.1 - pct.2) -> markers_tall_vs_thymus
+
+markers_tall_vs_everything %>% 
+  tibble::rownames_to_column("gene") %>% 
+  left_join(fish_to_human, by = c("gene" = "Gene")) %>%
+  mutate("diff_in_pct" = pct.1 - pct.2) -> markers_tall_vs_everything
+
+write_rds(markers_tall_vs_everything, path="/data/langenau/ally_blood/markers_tall_vs_everything.rds")
+write_rds(markers_tall_vs_thymus, path="/data/langenau/ally_blood/markers_tall_vs_thymus.rds")
+
+FeaturePlot(alex_indrops_ball_tall_round1.08282018, features = "eif2s1b", label = TRUE)
+FeaturePlot(alex_indrops_ball_tall_round1.08282018, features = "rag1", label = TRUE)
+FeaturePlot(alex_indrops_ball_tall_round1.08282018, features = "cycsb", label = TRUE)
+FeaturePlot(alex_indrops_ball_tall_round1.08282018, features = "prmt1", label = TRUE)
+
+#### to normal T cells from Yan's data ####
+
+indrop.combined_t_cells <- merge(subset(alex_indrops_ball_tall_round1.08282018, idents = c(0,1)), y = indrops_tcells,  project = "yan_T_with_ally_TALL_Thymus")
+dim(indrop.combined_t_cells@assays$RNA)
+indrop.combined_t_cells <- NormalizeData(indrop.combined_t_cells)
+indrop.combined_t_cells <- ScaleData(indrop.combined_t_cells)
+indrop.combined_t_cells <- FindVariableFeatures(indrop.combined_t_cells)
+indrop.combined_t_cells <- RunPCA(indrop.combined_t_cells)
+PCAPlot(indrop.combined_t_cells, group.by = "orig.ident")
+indrop.combined_t_cells <- FindNeighbors(indrop.combined_t_cells)
+indrop.combined_t_cells <- FindClusters(indrop.combined_t_cells)
+indrop.combined_t_cells <- RunTSNE(indrop.combined_t_cells)
+
+TSNEPlot(indrop.combined_t_cells, group.by="orig.ident", label=TRUE)
+TSNEPlot(indrop.combined_t_cells, label=TRUE)
+
+table(indrop.combined_t_cells@meta.data$orig.ident)
+
+```
+
